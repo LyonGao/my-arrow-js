@@ -73,10 +73,14 @@ export type AsyncComponentInstaller = <
 ) => Component<TEvents> | ComponentWithProps<TProps, TEvents>
 
 export interface ComponentCall {
-  h: ComponentFactory
-  p: Props<ReactiveTarget> | undefined
-  e: Events<EventMap> | undefined
-  k: ArrowTemplateKey
+  /** Component factory that produced this call. */
+  factory: ComponentFactory
+  /** Props object passed into the component (may be undefined). */
+  props: Props<ReactiveTarget> | undefined
+  /** Event handlers map passed as the second argument. */
+  events: Events<EventMap> | undefined
+  /** List reconciliation key (set via `.key()`). */
+  listKey: ArrowTemplateKey
   key: (key: ArrowTemplateKey) => ComponentCall
 }
 
@@ -94,27 +98,29 @@ export interface ComponentWithProps<
 let asyncComponentInstaller: AsyncComponentInstaller | null = null
 
 type SourceBox = Reactive<{
-  0: Props<ReactiveTarget> | undefined
-  1: ComponentFactory
-  2: Events<EventMap> | undefined
+  props: Props<ReactiveTarget> | undefined
+  factory: ComponentFactory
+  events: Events<EventMap> | undefined
 }>
 function setComponentKey(this: ComponentCall, key: ArrowTemplateKey) {
-  this.k = key
+  this.listKey = key
   return this
 }
 
 const propsProxyHandler: ProxyHandler<SourceBox> = {
   get(target, key) {
-    return target[0]?.[key as keyof (typeof target)[0]]
+    return (target.props as Record<PropertyKey, unknown> | undefined)?.[
+      key as PropertyKey
+    ]
   },
   has(target, key) {
-    return key in (target[0] || {})
+    return key in (target.props || {})
   },
   ownKeys(target) {
-    return Reflect.ownKeys(target[0] || {})
+    return Reflect.ownKeys(target.props || {})
   },
   getOwnPropertyDescriptor(target, key) {
-    const source = target[0]
+    const source = target.props
     return source && {
       configurable: true,
       enumerable: true,
@@ -123,22 +129,22 @@ const propsProxyHandler: ProxyHandler<SourceBox> = {
     }
   },
   set(target, key, value) {
-    return !!target[0] && Reflect.set(target[0] as object, key, value)
+    return !!target.props && Reflect.set(target.props as object, key, value)
   },
 }
 
 const narrowedPropsHandler: ProxyHandler<{
-  k: PropertyKey[]
-  s: object
+  keys: PropertyKey[]
+  source: object
 }> = {
   get(target, key) {
-    return target.k.includes(key)
-      ? (target.s as Record<PropertyKey, unknown>)[key as PropertyKey]
+    return target.keys.includes(key)
+      ? (target.source as Record<PropertyKey, unknown>)[key as PropertyKey]
       : undefined
   },
   set(target, key, value) {
-    if (!target.k.includes(key)) return false
-    return Reflect.set(target.s, key, value)
+    if (!target.keys.includes(key)) return false
+    return Reflect.set(target.source, key, value)
   },
 }
 
@@ -155,8 +161,8 @@ export function pick<T extends object, K extends keyof T>(
 ): T | Pick<T, K> {
   return keys.length
     ? (new Proxy({
-        k: keys as PropertyKey[],
-        s: source,
+        keys: keys as PropertyKey[],
+        source,
       }, narrowedPropsHandler) as unknown as Pick<T, K>)
     : source
 }
@@ -210,10 +216,10 @@ export function component<
 
   return ((input?: Props<T>, events?: Events<TEvents>) =>
     ({
-      h: factory as SyncFactory<T, TEvents> as ComponentFactory,
-      k: undefined,
-      p: input as Props<ReactiveTarget> | undefined,
-      e: events as Events<EventMap> | undefined,
+      factory: factory as SyncFactory<T, TEvents> as ComponentFactory,
+      listKey: undefined,
+      props: input as Props<ReactiveTarget> | undefined,
+      events: events as Events<EventMap> | undefined,
       key: setComponentKey,
     })) as Component<TEvents> | ComponentWithProps<T, TEvents>
 }
@@ -224,8 +230,8 @@ export function installAsyncComponentInstaller(
   asyncComponentInstaller = installer
 }
 
-export function isCmp(value: unknown): value is ComponentCall {
-  return !!value && typeof value === 'object' && 'h' in value
+export function isComponentCall(value: unknown): value is ComponentCall {
+  return !!value && typeof value === 'object' && 'factory' in value
 }
 
 export function createPropsProxy(
@@ -233,9 +239,9 @@ export function createPropsProxy(
   factory: ComponentFactory,
   events?: Events<EventMap>
 ): [Props<ReactiveTarget>, Emit<EventMap>, SourceBox] {
-  const box = reactive({ 0: source, 1: factory, 2: events })
+  const box = reactive({ props: source, factory, events })
   const emit = ((event: keyof EventMap, payload: unknown) => {
-    const handler = box[2]?.[event]
+    const handler = box.events?.[event]
     if (typeof handler === 'function') handler(payload)
   }) as Emit<EventMap>
 

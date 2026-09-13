@@ -7,8 +7,10 @@ import { Reactive, PropertyObserver, ReactiveTarget } from './reactive'
 const queueMarker = Symbol()
 type QueuedFunction = CallableFunction & {
   [queueMarker]?: boolean
-  _n?: unknown
-  _o?: unknown
+  /** Pending new value for the queued observer. */
+  newValue?: unknown
+  /** Pending old value for the queued observer. */
+  oldValue?: unknown
 }
 let queueStack: QueuedFunction[] = []
 /**
@@ -33,20 +35,20 @@ export function nextTick(fn?: CallableFunction): Promise<unknown> {
       )
 }
 
-export function isTpl(template: unknown): template is ArrowTemplate {
-  return typeof template === 'function' && !!(template as ArrowTemplate).isT
+export function isArrowTemplate(template: unknown): template is ArrowTemplate {
+  return typeof template === 'function' && !!(template as ArrowTemplate).isTemplate
 }
 
-export function isO(obj: unknown): obj is ReactiveTarget {
+export function isObject(obj: unknown): obj is ReactiveTarget {
   return obj !== null && typeof obj === 'object'
 }
 
-export function isR(obj: unknown): obj is Reactive<ReactiveTarget> {
-  return isO(obj) && '$on' in obj
+export function isReactive(obj: unknown): obj is Reactive<ReactiveTarget> {
+  return isObject(obj) && '$on' in obj
 }
 
 export function isChunk(chunk: unknown): chunk is Chunk {
-  return isO(chunk) && 'ref' in chunk
+  return isObject(chunk) && 'ref' in chunk
 }
 
 /**
@@ -63,8 +65,8 @@ export function queue<T extends unknown>(
   return (newValue?: T, oldValue?: T) => {
     if (!queued[queueMarker]) {
       queued[queueMarker] = true
-      queued._n = newValue
-      queued._o = oldValue
+      queued.newValue = newValue
+      queued.oldValue = oldValue
       if (!queueStack.length) {
         queueMicrotask(executeQueue)
       }
@@ -80,10 +82,10 @@ function executeQueue() {
   nextTicks = []
   for (let i = 0; i < queue.length; i++) {
     const fn = queue[i]
-    const newValue = fn._n
-    const oldValue = fn._o
-    fn._n = undefined
-    fn._o = undefined
+    const newValue = fn.newValue
+    const oldValue = fn.oldValue
+    fn.newValue = undefined
+    fn.oldValue = undefined
     fn[queueMarker] = false
     fn(newValue, oldValue)
   }

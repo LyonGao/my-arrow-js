@@ -25,7 +25,7 @@ export function hydrateTemplate(
   const hydration = createNodeMap(stage.childNodes, parent)
   if (!hydration) return false
 
-  adoptCapturedChunk(capture, template._c(), hydration.map)
+  adoptCapturedChunk(capture, template.getChunk(), hydration.map)
   if (stats) stats.mismatches = hydration.mismatches
   stage.textContent = ''
   return true

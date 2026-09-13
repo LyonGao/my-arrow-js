@@ -42,10 +42,10 @@ type ComponentFactory = (
 
 interface ComponentCall {
   __arrowSandboxComponent: true
-  h: ComponentFactory
-  p: ComponentProps
-  e: ComponentEvents | undefined
-  k: unknown
+  factory: ComponentFactory
+  props: ComponentProps
+  events: ComponentEvents | undefined
+  listKey: unknown
   key: (key: unknown) => ComponentCall
 }
 
@@ -153,35 +153,39 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as
 }
 
 function setComponentKey(this: ComponentCall, key: unknown) {
-  this.k = key
+  this.listKey = key
   return this
 }
 
-const propsProxyHandler: ProxyHandler<Record<number, unknown>> = {
+const propsProxyHandler: ProxyHandler<{
+  props: ComponentProps
+  factory: ComponentFactory
+  events: ComponentEvents | undefined
+}> = {
   get(target, key) {
-    const source = target[0] as ComponentProps
+    const source = target.props
     if (!source) return undefined
     return (source as Record<PropertyKey, unknown>)[key]
   },
   set(target, key, value) {
-    const source = target[0] as ComponentProps
+    const source = target.props
     if (!source) return false
     return Reflect.set(source as object, key, value)
   },
 }
 
 const narrowedPropsHandler: ProxyHandler<{
-  k: PropertyKey[]
-  s: object
+  keys: PropertyKey[]
+  source: object
 }> = {
   get(target, key) {
-    return target.k.includes(key)
-      ? (target.s as Record<PropertyKey, unknown>)[key]
+    return target.keys.includes(key)
+      ? (target.source as Record<PropertyKey, unknown>)[key]
       : undefined
   },
   set(target, key, value) {
-    if (!target.k.includes(key)) return false
-    return Reflect.set(target.s, key, value)
+    if (!target.keys.includes(key)) return false
+    return Reflect.set(target.source, key, value)
   },
 }
 
@@ -232,12 +236,13 @@ function createPropsProxy(
   factory: ComponentFactory,
   events?: ComponentEvents
 ) {
-  const box = reactive({ 0: source, 1: factory, 2: events }) as Record<
-    number,
-    unknown
-  >
+  const box = reactive({ props: source, factory, events }) as {
+    props: ComponentProps
+    factory: ComponentFactory
+    events: ComponentEvents | undefined
+  }
   const emit = ((event: PropertyKey, payload: unknown) => {
-    const handlers = box[2] as ComponentEvents | undefined
+    const handlers = box.events
     const handler = handlers?.[event as keyof ComponentEvents]
     if (typeof handler === 'function') {
       handler(payload)
@@ -365,13 +370,13 @@ function normalizeRenderable(
   }
 
   if (isComponentCall(value)) {
-    const [props, emit] = createPropsProxy(value.p, value.h, value.e)
+    const [props, emit] = createPropsProxy(value.props, value.factory, value.events)
     const cleanups: Array<() => void> = []
     const previousCollector = swapCleanupCollector(cleanups)
     let renderable: unknown
 
     try {
-      renderable = value.h(props, emit)
+      renderable = value.factory(props, emit)
     } finally {
       swapCleanupCollector(previousCollector)
     }
@@ -774,10 +779,10 @@ export function component(
   return ((input?: ComponentProps, events?: ComponentEvents) =>
     ({
       __arrowSandboxComponent: true,
-      h: factory,
-      k: undefined,
-      p: input,
-      e: events,
+      factory,
+      listKey: undefined,
+      props: input,
+      events,
       key: setComponentKey,
     })) as SandboxComponent
 }
@@ -789,8 +794,8 @@ export function pick<T extends object, K extends keyof T>(
   return keys.length
     ? (new Proxy(
         {
-          k: keys as PropertyKey[],
-          s: source,
+          keys: keys as PropertyKey[],
+          source,
         },
         narrowedPropsHandler
       ) as unknown as Pick<T, K>)

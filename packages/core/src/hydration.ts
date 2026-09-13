@@ -47,7 +47,7 @@ export function adoptCapturedChunk(
   if (visited.has(chunk)) return
   visited.add(chunk)
   const ref = chunk.ref
-  if (ref.f) ref.f = (map.get(ref.f) as ChildNode | undefined) ?? ref.f
-  if (ref.l) ref.l = (map.get(ref.l) as ChildNode | undefined) ?? ref.l
+  if (ref.first) ref.first = (map.get(ref.first) as ChildNode | undefined) ?? ref.first
+  if (ref.last) ref.last = (map.get(ref.last) as ChildNode | undefined) ?? ref.last
   capture.hooks.get(chunk)?.forEach((hook) => hook(map, visited))
 }

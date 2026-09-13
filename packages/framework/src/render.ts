@@ -56,5 +56,5 @@ export function toTemplate(view: unknown): ArrowTemplate {
 }
 
 function isTemplate(value: unknown): value is ArrowTemplate {
-  return typeof value === 'function' && !!(value as { isT?: boolean }).isT
+  return typeof value === 'function' && !!(value as { isTemplate?: boolean }).isTemplate
 }

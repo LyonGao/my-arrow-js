@@ -1,4 +1,4 @@
-import { isR, isO, queue, registerCleanup } from './common'
+import { isReactive, isObject, queue, registerCleanup } from './common'
 import { expressionPool, onExpressionUpdate } from './expressions'
 import { ArrowFunction, ArrowRenderable } from './html'
 
@@ -162,9 +162,9 @@ export function reactive<T extends ReactiveTarget, TValue>(
     return state as Computed<TValue>
   }
   // The data is already a reactive object, so return it.
-  if (isR(data)) return data as Reactive<T>
+  if (isReactive(data)) return data as Reactive<T>
   // Only valid objects can be reactive.
-  if (!isO(data)) throw Error('Expected object')
+  if (!isObject(data)) throw Error('Expected object')
   // Create a new slot in the listeners registry and then store the relationship
   // of this object to its index.
   const id = ++index
@@ -228,7 +228,7 @@ const proxyHandler: ProxyHandler<ReactiveTarget> = {
     if (key in api) return api[key as keyof typeof api]
     const result = Reflect.get(target, key, receiver)
     let child: Reactive<ReactiveTarget> | undefined
-    if (isO(result) && !isR(result)) {
+    if (isObject(result) && !isReactive(result)) {
       child = createChild(result, id, key)
       ;(target as Record<PropertyKey, unknown>)[key] = child
     }
@@ -242,14 +242,14 @@ const proxyHandler: ProxyHandler<ReactiveTarget> = {
     const id = getId(target as object)
     const isNewProperty = !(key in target)
     const newReactive =
-      isO(value) && !isR(value) ? createChild(value, id, key) : null
+      isObject(value) && !isReactive(value) ? createChild(value, id, key) : null
     const oldValue = (target as Record<PropertyKey, unknown>)[key]
     const newValue = newReactive ?? value
-    if (isR(newValue) && computedIds[getId(newValue as object)]) {
+    if (isReactive(newValue) && computedIds[getId(newValue as object)]) {
       linkParent(getId(newValue as object), id, key)
     }
     const didSucceed = Reflect.set(target, key, newValue, receiver)
-    if (oldValue !== newValue && isR(oldValue) && isR(newValue)) {
+    if (oldValue !== newValue && isReactive(oldValue) && isReactive(newValue)) {
       const oldParents = parents[getId(oldValue as object)]
       if (oldParents) {
         let index = -1
@@ -296,7 +296,7 @@ function createChild(
 }
 
 function isComputed(value: unknown): value is Reactive<{ value: unknown }> {
-  return isR(value) && computedIds[getId(value as object)]
+  return isReactive(value) && computedIds[getId(value as object)]
 }
 
 function readComputed(

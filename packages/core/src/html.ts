@@ -1,5 +1,24 @@
+/**
+ * Arrow tagged-template renderer (no VDOM).
+ *
+ * Runtime pipeline:
+ *   html`...`  → ArrowTemplate (recipe: strings + expressions)
+ *   tpl(parent) → acquire Chunk (instance: cloned DOM + bindings)
+ *   createBindings → wire attrs / text / children
+ *   watch / createRenderFn → fine-grained updates + list patch
+ *   unmount → recycle (stale pool) or destroy (object pool)
+ *
+ * Key ideas:
+ * - Templates are parsed once via the browser HTML parser into a memoized
+ *   ChunkProto (`<!--¤-->` marks expression slots).
+ * - Expression values live in `expressionPool` (see expressions.ts), not in
+ *   per-binding closures, so syncing a reused chunk is `writeExpressions`.
+ * - Only function expressions are reactive; plain values bind once.
+ * - List updates prefer same-shape sync, then keyed moves, then rebuild.
+ */
+
 import { watch } from './reactive'
-import { isChunk, isTpl, swapCleanupCollector } from './common'
+import { isChunk, isArrowTemplate, swapCleanupCollector } from './common'
 import { setAttr } from './dom'
 import {
   adoptCapturedChunk,
@@ -9,7 +28,7 @@ import {
 import type { HydrationCapture, NodeMap } from './hydration'
 import {
   createPropsProxy,
-  isCmp,
+  isComponentCall,
 } from './component'
 import type { ComponentCall } from './component'
 import {
@@ -20,20 +39,38 @@ import {
   writeExpressions,
 } from './expressions'
 
+// ---------------------------------------------------------------------------
+// Public / internal types
+// ---------------------------------------------------------------------------
+
+/**
+ * Callable template object returned by `html` / `svg`.
+ *
+ * Call signatures:
+ * - `tpl(parent)` — mount into `parent`, return that parent
+ * - `tpl()` — return a DocumentFragment of the rendered nodes
+ */
 export interface ArrowTemplate {
   (parent: ParentNode): ParentNode
   (): DocumentFragment
-  isT: boolean
+  /** Marker used by `isArrowTemplate()` — always true for templates. */
+  isTemplate: boolean
+  /** List reconciliation key (like React/Vue `:key`). */
   key: (key: ArrowTemplateKey) => ArrowTemplate
+  /** Stable identity for stale-chunk reuse across remounts. */
   id: (id: ArrowTemplateId) => ArrowTemplate
-  _c: () => Chunk
-  _k: ArrowTemplateKey
-  _i?: ArrowTemplateId
+  /** Ensure / return the Chunk instance bound to this template. */
+  getChunk: () => Chunk
+  /** Current list key value (set via `.key()`). */
+  listKey: ArrowTemplateKey
+  /** Current stable id value (set via `.id()`). */
+  stableId?: ArrowTemplateId
 }
 
 export type ArrowTemplateKey = string | number | undefined
 type ArrowTemplateId = string | number | undefined
 
+/** Values a template expression / render slot may produce. */
 export type ArrowRenderable =
   | string
   | number
@@ -44,17 +81,24 @@ export type ArrowRenderable =
   | ArrowTemplate
   | Array<string | number | boolean | ComponentCall | ArrowTemplate>
 
+/** Legacy reactive-expression shape (kept for typing compatibility; unused by current runtime). */
 export interface ReactiveFunction {
   (el?: Node): ArrowRenderable
   $on: (observer: ArrowFunction | null) => ArrowFunction | null
-  _up: (newExpression: ReactiveFunction) => void
-  e: ArrowExpression
-  s: boolean
+  /** Replace the underlying expression. */
+  update: (newExpression: ReactiveFunction) => void
+  /** Current expression value / getter. */
+  expression: ArrowExpression
+  /** Whether this slot is treated as static (non-tracking). */
+  isStatic: boolean
 }
 
+/** Legacy bag of reactive expression slots (unused by current runtime). */
 export type ReactiveExpressions = {
-  i: number
-  e: ReactiveFunction[]
+  /** Cursor / write index into `expressions`. */
+  index: number
+  /** Reactive expression functions for each template slot. */
+  expressions: ReactiveFunction[]
 }
 
 export interface ArrowFragment {
@@ -72,49 +116,96 @@ export type RenderGroup =
 
 export type ArrowFunction = (...args: unknown[]) => ArrowRenderable
 
+/** Anything valid inside `${...}` of an `html` template. */
 export type ArrowExpression =
   | ArrowRenderable
   | ArrowFunction
   | EventListener
   | ((evt: InputEvent) => void)
 
+/**
+ * One live instance of a template in the DOM.
+ *
+ * Relationship: ArrowTemplate (recipe) + mount → Chunk (product).
+ * Many templates sharing the same static strings share one ChunkProto mold.
+ */
 export interface Chunk {
+  /**
+   * 绑定位置表：`[pathTape, attrNames]`。
+   *
+   * - `attrNames`：出现过的属性名列表（如 `"class"`、`"@click"`），供属性槽引用。
+   * - `pathTape`：扁平数字带，按顺序编码每一个 `${}` 在克隆 DOM 里的位置。
+   *
+   * 每个绑定槽在 tape 上是一段变长记录：
+   *   `[sharedDepth, remaining, childIndex × remaining, segment]`
+   *
+   * - `sharedDepth`：与上一个槽共用的祖先深度（可复用 `nodeStack`，少走几层）。
+   * - `remaining`：还要再往下走几层。
+   * - 随后 `remaining` 个数字：每层取 `childNodes[index]`。
+   * - `segment`：`0` = 节点/文本槽（走 createNodeBinding）；
+   *   `>0` = 属性槽，属性名是 `attrNames[segment - 1]`（走 createAttrBinding）。
+   *
+   * 由 createPaths 在解析模板时生成，createBindings 再按 tape 走到真实节点并接线。
+   */
   paths: [number[], string[]]
+  /** Cloned template content (may be empty after nodes move into the document). */
   dom: DocumentFragment
+  /** First/last ChildNode of this chunk's span in the live tree. */
   ref: DOMRef
-  _t: ArrowTemplate
-  k?: ArrowTemplateKey
-  i?: ArrowTemplateId
-  e: number
-  g: string
-  b: boolean
-  r: boolean
-  st: boolean
-  bkn?: Chunk
-  v?: Array<[Element, string]> | null
-  u?: Array<() => void> | null
-  s?: ReturnType<typeof createPropsProxy>[2]
-  mk?: number
-  next?: Chunk
+  /** Template currently bound to this chunk. */
+  template: ArrowTemplate
+  /** List key for keyed patching. */
+  key?: ArrowTemplateKey
+  /** Stable id for exact stale reuse. */
+  stableId?: ArrowTemplateId
+  /** Start index of this chunk's block in `expressionPool`. */
+  expressionPointer: number
+  /** Shape signature — must match to sync without remount. */
+  signature: string
+  /** True after `createBindings` has run. */
+  isBound: boolean
+  /**
+   * Recyclable flag. False once the chunk hosts nested templates/components
+   * (those need full destroy rather than stale reuse).
+   */
+  recyclable: boolean
+  /** Currently sitting in the stale pool. */
+  isStale: boolean
+  /** Next chunk in a stale-by-signature linked list. */
+  staleNext?: Chunk
+  /** Event listener records `[element, eventName]` for cleanup. */
+  eventRecords?: Array<[Element, string]> | null
+  /** Stop/cleanup callbacks run on destroy. */
+  cleanups?: Array<() => void> | null
+  /** Component props/emit box when this chunk came from a component. */
+  propsBox?: ReturnType<typeof createPropsProxy>[2]
+  /** Transient mark used while patching lists to find stale items. */
+  renderMark?: number
+  /** Free-list link for the chunk object pool. */
+  poolNext?: Chunk
 }
 
+/** Memoized parse result shared by all chunks of the same template shape. */
 interface ChunkProto {
-  readonly template: HTMLTemplateElement
+  readonly htmlTemplate: HTMLTemplateElement
   readonly paths: Chunk['paths']
-  readonly g: string
+  readonly signature: string
   readonly expressions: number
 }
 
+/** Span of sibling nodes belonging to one chunk (first / last). */
 interface DOMRef {
-  f: ChildNode | null
-  l: ChildNode | null
+  first: ChildNode | null
+  last: ChildNode | null
 }
 
+/** Per-element store for `@event` bindings → expressionPool slot. */
 const eventBindingsKey = Symbol()
 
 interface EventBindingMeta {
-  c: Chunk
-  p: number
+  chunk: Chunk
+  /** expressionPool index of the listener function */
+  expressionPointer: number
 }
 
 interface EventBoundElement extends Element {
@@ -122,51 +213,77 @@ interface EventBoundElement extends Element {
 }
 
 type Rendered = Chunk | Text
+/** Closure that patches a dynamic child slot; `adopt` remaps nodes after hydrate. */
 type RenderController = ((
   renderable: ArrowRenderable
 ) => DocumentFragment | Text | void) & {
   adopt: (map: NodeMap, visited: WeakSet<Chunk>) => void
 }
+
+/** ArrowTemplate plus runtime-only fields used inside this module. */
 type InternalTemplate = ArrowTemplate & {
-  _a?: ArrayLike<unknown>
-  _h?: Chunk
-  _m?: boolean
-  _p?: ChunkProto
-  _s?: TemplateStringsArray | string[]
+  /** Expression slot values from the tagged-template call. */
+  expressionSlots?: ArrayLike<unknown>
+  /** Currently attached chunk, if any. */
+  boundChunk?: Chunk
+  /** Mounted flag (`true` while this template owns a live chunk). */
+  mounted?: boolean
+  /** Cached ChunkProto for this template instance. */
+  chunkProto?: ChunkProto
+  /** Static string parts of the tagged template. */
+  strings?: TemplateStringsArray | string[]
 }
 
+/** Head of a singly-linked stale list for one signature. */
 interface StaleBucket {
-  h?: Chunk
+  head?: Chunk
 }
 
+// ---------------------------------------------------------------------------
+// Module state: binding walk stacks, delimiter, caches, pools
+// ---------------------------------------------------------------------------
+
+/** Scratch stacks reused while walking path tapes (avoids per-bind alloc). */
 let bindingStackPos = -1
 const bindingStack: Array<Node | number> = []
 const nodeStack: Node[] = []
 
+/** Expression placeholder inserted between static HTML string parts. */
 const delimiter = '¤'
 const delimiterComment = `<!--${delimiter}-->`
 const initialChunkPoolSize = 1024
 
+/** signature → ChunkProto, keyed by Document (jsdom / multi-realm safe). */
 const chunkMemo = new WeakMap<Document, Record<string, ChunkProto>>()
+/** Fast path: TemplateStringsArray identity → ChunkProto (no string join). */
 const chunkMemoByRef = new WeakMap<
   ReadonlyArray<string>,
   WeakMap<Document, ChunkProto>
 >()
+/** Exact reuse by template `.id()`. */
 const staleById = new Map<Exclude<ArrowTemplateId, undefined>, Chunk>()
+/** Same-shape reuse by signature. */
 const staleBySignature = new Map<string, StaleBucket>()
+/** Object pool of blank Chunk shells. */
 let chunkPoolHead: Chunk | undefined
+/** Incrementing stamp for list patch "still in use" marks. */
 let renderedMark = 0
 
 growChunkPool(initialChunkPoolSize)
 
+// ---------------------------------------------------------------------------
+// DOM span helpers + ChunkProto resolution / chunk lifecycle
+// ---------------------------------------------------------------------------
+
+/** Move every node in `ref` (inclusive f→l) under `parent`, before `before`. */
 function moveDOMRef(
   ref: DOMRef,
   parent: Node | null,
   before?: ChildNode | null
 ) {
-  let node = ref.f
+  let node = ref.first
   if (!parent || !node) return
-  const last = ref.l
+  const last = ref.last
   while (true) {
     const next: ChildNode | null =
       node === last ? null : (node.nextSibling as ChildNode | null)
@@ -176,21 +293,38 @@ function moveDOMRef(
   }
 }
 
+/** True when template and chunk share the same static HTML shape. */
 function canSyncTemplateChunk(template: InternalTemplate, chunk: Chunk) {
-  return chunk.g === getChunkProto(template).g
+  return chunk.signature === getChunkProto(template).signature
 }
 
 function getChunkProto(template: InternalTemplate): ChunkProto {
-  const cached = template._p
+  const cached = template.chunkProto
   if (cached) return cached
-  return (template._p = resolveChunkProto(template._s as string[]))
+  return (template.chunkProto = resolveChunkProto(template.strings as string[]))
 }
 
+/**
+ * Parse static strings into a reusable ChunkProto.
+ *
+ * Steps: join with `<!--¤-->` → `template.innerHTML` → walk for paths →
+ * replace placeholders with empty text nodes → memoize by strings ref + signature.
+ */
 function resolveChunkProto(
   rawStrings: TemplateStringsArray | string[],
   svg?: boolean
 ): ChunkProto {
   const doc = document
+
+  /** signature → ChunkProto, keyed by Document (jsdom / multi-realm safe). */
+  // const chunkMemo = new WeakMap<Document, Record<string, ChunkProto>>()
+
+  /** Fast path: TemplateStringsArray identity → ChunkProto (no string join). */
+  // const chunkMemoByRef = new WeakMap<
+  //   ReadonlyArray<string>,
+  //   WeakMap<Document, ChunkProto>
+  // >()
+
   let memoByRef = svg ? undefined : chunkMemoByRef.get(rawStrings)
   const cachedByRef = memoByRef?.get(doc)
   if (cachedByRef) return cachedByRef
@@ -214,6 +348,7 @@ function resolveChunkProto(
 
   const template = document.createElement('template')
   if (svg) {
+    // Force SVG namespace, then unwrap so proto content is the inner nodes.
     template.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg">${signature}</svg>`
     const root = template.content.firstChild as SVGElement | null
     if (root) {
@@ -227,18 +362,20 @@ function resolveChunkProto(
   const paths = createPaths(template.content)
   normalizeNodePlaceholders(template.content)
   const expressions = rawStrings.length - 1
+  // Count path-tape records; each must correspond to one `${}` slot.
   let count = 0
   for (let i = 0; i < paths[0].length;) {
     i += (paths[0][i + 1] ?? 0) + 3
     count++
   }
   if (count !== expressions) {
+    // e.g. expression landed in an illegal HTML position after parsing.
     throw Error('Invalid HTML position')
   }
   const created = {
-    template,
+    htmlTemplate: template,
     paths,
-    g: cacheKey,
+    signature: cacheKey,
     expressions,
   }
   if (!svg) {
@@ -250,41 +387,48 @@ function resolveChunkProto(
   return created
 }
 
+/**
+ * Point `chunk` at `template` and push expression values into the pool.
+ * Same-shape reuse updates in place without rebuilding DOM bindings.
+ */
 function syncTemplateToChunk(
   template: InternalTemplate,
   chunk: Chunk,
-  mounted = false
+  mounted = false 
 ) {
-  if (chunk._t === template) {
-    chunk.k = template._k
-    chunk.i = template._i
-    template._h = chunk
-    template._m = mounted
+  if (chunk.template === template) {
+    chunk.key = template.listKey
+    chunk.stableId = template.stableId
+    template.boundChunk = chunk
+    template.mounted = mounted
     return
   }
-  if (chunk._t && chunk._t !== template) {
-    const current = chunk._t as InternalTemplate
-    if (current._h === chunk) {
-      current._m = false
-      current._h = undefined
+  // Detach previous template ownership if this chunk is being reassigned.
+  if (chunk.template && chunk.template !== template) {
+    const current = chunk.template as InternalTemplate
+    if (current.boundChunk === chunk) {
+      current.mounted = false
+      current.boundChunk = undefined
     }
   }
-  chunk._t = template
-  chunk.k = template._k
-  chunk.i = template._i
-  template._h = chunk
-  template._m = mounted
-  writeExpressions(template._a!, chunk.e)
+  chunk.template = template
+  chunk.key = template.listKey
+  chunk.stableId = template.stableId
+  template.boundChunk = chunk
+  template.mounted = mounted
+  writeExpressions(template.expressionSlots!, chunk.expressionPointer)
 }
 
+/** Clear template↔chunk ownership when unmounting / recycling. */
 function releaseTemplate(chunk: Chunk) {
-  const template = chunk._t as InternalTemplate
-  if (template._h === chunk) {
-    template._m = false
-    template._h = undefined
+  const template = chunk.template as InternalTemplate
+  if (template.boundChunk === chunk) {
+    template.mounted = false
+    template.boundChunk = undefined
   }
 }
 
+/** Preallocate blank Chunk shells linked via `poolNext` onto `chunkPoolHead`. */
 function growChunkPool(size: number) {
   let head: Chunk | undefined
   let tail: Chunk | undefined
@@ -292,121 +436,151 @@ function growChunkPool(size: number) {
     const chunk = {
       paths: [[], []],
       dom: null as unknown as DocumentFragment,
-      ref: { f: null, l: null },
-      _t: null as unknown as ArrowTemplate,
-      e: -1,
-      g: '',
-      b: false,
-      r: true,
-      st: false,
-      u: null,
-      v: null,
-      s: undefined,
-      k: undefined,
-      i: undefined,
-      bkn: undefined,
-      next: undefined,
+      ref: { first: null, last: null },
+      template: null as unknown as ArrowTemplate,
+      expressionPointer: -1,
+      signature: '',
+      isBound: false,
+      recyclable: true,
+      isStale: false,
+      cleanups: null,
+      eventRecords: null,
+      propsBox: undefined,
+      key: undefined,
+      stableId: undefined,
+      staleNext: undefined,
+      poolNext: undefined,
     } as Chunk
-    if (tail) tail.next = chunk
+    if (tail) tail.poolNext = chunk
     else head = chunk
     tail = chunk
   }
-  if (tail) tail.next = chunkPoolHead
+  if (tail) tail.poolNext = chunkPoolHead
   chunkPoolHead = head
 }
 
+/** Return a destroyed chunk shell to the free list. */
 function freeChunk(chunk: Chunk) {
-  chunk.next = chunkPoolHead
+  chunk.poolNext = chunkPoolHead
   chunkPoolHead = chunk
 }
 
+/** Fill a pooled shell from proto: clone DOM, alloc expressions, bind template. */
 function configureChunk(
   chunk: Chunk,
   proto: ChunkProto,
   template: InternalTemplate
 ) {
   chunk.paths = proto.paths
-  chunk.g = proto.g
-  chunk.dom = proto.template.content.cloneNode(true) as DocumentFragment
-  chunk.ref.f = chunk.dom.firstChild as ChildNode | null
-  chunk.ref.l = chunk.dom.lastChild as ChildNode | null
-  chunk.e = createExpressionBlock(proto.expressions)
-  chunk.b = chunk.st = false
-  chunk.r = true
-  chunk.u = chunk.v = null
-  chunk.s = chunk.bkn = undefined
+  chunk.signature = proto.signature
+  chunk.dom = proto.htmlTemplate.content.cloneNode(true) as DocumentFragment
+  chunk.ref.first = chunk.dom.firstChild as ChildNode | null
+  chunk.ref.last = chunk.dom.lastChild as ChildNode | null
+  chunk.expressionPointer = createExpressionBlock(proto.expressions)
+  chunk.isBound = chunk.isStale = false
+  chunk.recyclable = true
+  chunk.cleanups = chunk.eventRecords = null
+  chunk.propsBox = chunk.staleNext = undefined
   syncTemplateToChunk(template, chunk)
 }
 
+/**
+ * Obtain a Chunk for `template`, preferring:
+ * 1) exact stale hit by `.id()`
+ * 2) same-shape stale hit by signature
+ * 3) fresh configure from the object pool
+ */
 function acquireChunk(template: InternalTemplate): Chunk {
   const proto = getChunkProto(template)
-  const exact = staleById.get(template._i as Exclude<ArrowTemplateId, undefined>)
+  /** Exact reuse by template `.id()`. */
+  // const staleById = new Map<Exclude<ArrowTemplateId, undefined>, Chunk>()
+  const exact = staleById.get(template.stableId as Exclude<ArrowTemplateId, undefined>)
   if (exact) {
-    if (exact.g !== proto.g) throw Error('shape mismatch')
-    if (exact.r) {
+    if (exact.signature !== proto.signature) throw Error('shape mismatch')
+    if (exact.recyclable) {
       removeStaleChunk(exact)
       syncTemplateToChunk(template, exact)
       return exact
     }
   }
 
-  const bucket = staleBySignature.get(proto.g)
-  const reused = bucket?.h
+  /** Same-shape reuse by signature. */
+  // const staleBySignature = new Map<string, StaleBucket>()
+  const bucket = staleBySignature.get(proto.signature)
+  const reused = bucket?.head
   if (reused) {
     removeStaleChunk(reused)
     syncTemplateToChunk(template, reused)
     return reused
   }
 
+  /** Object pool of blank Chunk shells. */
+  // let chunkPoolHead: Chunk | undefined
   if (!chunkPoolHead) growChunkPool(initialChunkPoolSize)
   const chunk = chunkPoolHead!
-  chunkPoolHead = chunk.next
-  chunk.next = undefined
+  chunkPoolHead = chunk.poolNext
+  chunk.poolNext = undefined
   configureChunk(chunk, proto, template)
   return chunk
 }
 
+/** Unlink `chunk` from staleBySignature / staleById. */
 function removeStaleChunk(chunk: Chunk) {
-  if (!chunk.st) return
-  const bucket = staleBySignature.get(chunk.g)
+  if (!chunk.isStale) return
+  const bucket = staleBySignature.get(chunk.signature)
   if (bucket) {
     let previous: Chunk | undefined
-    let current = bucket.h
+    let current = bucket.head
     while (current && current !== chunk) {
       previous = current
-      current = current.bkn
+      current = current.staleNext
     }
     if (current) {
-      if (previous) previous.bkn = current.bkn
-      else bucket.h = current.bkn
-      if (!bucket.h) staleBySignature.delete(chunk.g)
+      if (previous) previous.staleNext = current.staleNext
+      else bucket.head = current.staleNext
+      if (!bucket.head) staleBySignature.delete(chunk.signature)
     }
   }
-  if (chunk.i !== undefined && staleById.get(chunk.i) === chunk) {
-    staleById.delete(chunk.i)
+  if (chunk.stableId !== undefined && staleById.get(chunk.stableId) === chunk) {
+    staleById.delete(chunk.stableId)
   }
-  chunk.st = false
-  chunk.bkn = undefined
+  chunk.isStale = false
+  chunk.staleNext = undefined
 }
 
+/**
+ * Shared listener for all `@event` bindings on an element.
+ * Looks up the current handler in expressionPool so updates don't re-addEventListener.
+ */
 function dispatchChunkEvent(this: Element, evt: Event) {
   const binding = (this as EventBoundElement)[eventBindingsKey]?.[evt.type]
   if (!binding) return
-  const chunk = binding.c
-  if (!(chunk._t as InternalTemplate)._m) return
-  ;(expressionPool[binding.p] as CallableFunction | undefined)?.(evt)
+  const chunk = binding.chunk
+  // Ignore events after the owning template was unmounted.
+  if (!(chunk.template as InternalTemplate).mounted) return
+  ;(expressionPool[binding.expressionPointer] as CallableFunction | undefined)?.(evt)
 }
 
 function getRenderableKey(
   renderable: ComponentCall | ArrowTemplate
 ): Exclude<ArrowTemplateKey, undefined> | undefined {
-  return (isCmp(renderable)
-    ? renderable.k
-    : (renderable as InternalTemplate)._k) as
+  return (isComponentCall(renderable)
+    ? renderable.listKey
+    : (renderable as InternalTemplate).listKey) as
     | Exclude<ArrowTemplateKey, undefined>
     | undefined
 }
 
+// ---------------------------------------------------------------------------
+// Public API: html / svg
+// ---------------------------------------------------------------------------
+
+/**
+ * Tagged template that builds an ArrowTemplate (does not mount yet).
+ *
+ * @example
+ * html`<button @click="${() => n++}">${() => n}</button>`(document.body)
+ */
 export function html(
   strings: TemplateStringsArray | string[],
   ...expSlots: ArrowExpression[]
@@ -415,18 +589,20 @@ export function html(
   strings: TemplateStringsArray | string[],
   ...expSlots: ArrowExpression[]
 ): ArrowTemplate {
+  // Callable object: tpl(parent?) → renderTemplate(...)
   const template = ((el?: ParentNode) =>
     renderTemplate(template as InternalTemplate, el)) as InternalTemplate
-  template.isT = true
-  template._a = expSlots
-  template._c = ensureChunk
-  template._m = false
-  template._s = strings
+  template.isTemplate = true
+  template.expressionSlots = expSlots
+  template.getChunk = ensureChunk
+  template.mounted = false
+  template.strings = strings
   template.key = setTemplateKey
   template.id = setTemplateId
   return template
 }
 
+/** Like `html`, but parses content in the SVG namespace. */
 export function svg(
   strings: TemplateStringsArray | string[],
   ...expSlots: ArrowExpression[]
@@ -436,38 +612,46 @@ export function svg(
   ...expSlots: ArrowExpression[]
 ): ArrowTemplate {
   const template = html(strings, ...expSlots) as InternalTemplate
-  template._p = resolveChunkProto(strings, true)
+  template.chunkProto = resolveChunkProto(strings, true)
   return template
 }
 
 function ensureChunk(this: InternalTemplate) {
-  let chunk = this._h
+  let chunk = this.boundChunk
   if (!chunk) {
     chunk = acquireChunk(this)
-    this._h = chunk
+    this.boundChunk = chunk
   }
   return chunk
 }
 
 function setTemplateKey(this: InternalTemplate, key: ArrowTemplateKey) {
-  this._k = key
-  if (this._h) this._h.k = key
+  this.listKey = key
+  if (this.boundChunk) this.boundChunk.key = key
   return this
 }
 
 function setTemplateId(this: InternalTemplate, id: ArrowTemplateId) {
-  this._i = id
-  if (this._h) this._h.i = id
+  this.stableId = id
+  if (this.boundChunk) this.boundChunk.stableId = id
   return this
 }
 
+/**
+ * Mount / remount entry used by `tpl(el?)`.
+ *
+ * - First mount, unbound: createBindings
+ * - First mount, recycled (already bound): just move DOM into place
+ * - Already mounted: move nodes back into chunk.dom then optionally re-append
+ */
 function renderTemplate(template: InternalTemplate, el?: ParentNode) {
-  const chunk = template._c()
-  if (!template._m) {
-    template._m = true
-    if (!chunk.b) {
+  const chunk = template.getChunk()
+  if (!template.mounted) {
+    template.mounted = true
+    if (!chunk.isBound) {
       return createBindings(chunk, el)
     }
+    // Stale reuse: bindings already exist; only place the DOM span.
     moveDOMRef(chunk.ref, el ?? chunk.dom)
     return el ?? chunk.dom
   }
@@ -475,16 +659,25 @@ function renderTemplate(template: InternalTemplate, el?: ParentNode) {
   return el ? el.appendChild(chunk.dom) : chunk.dom
 }
 
+// ---------------------------------------------------------------------------
+// First-time bindings: walk path tape → node / attr slots
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve every expression slot against the cloned DOM and optionally append
+ * the fragment to `el`. Marks `chunk.isBound = true`.
+ */
 function createBindings(
   chunk: Chunk,
   el?: ParentNode
 ): ParentNode | DocumentFragment {
-  const expressionPointer = chunk.e
+  const expressionPointer = chunk.expressionPointer
   const totalPaths = expressionPool[expressionPointer] as number
   const [pathTape, attrNames] = chunk.paths
   const stackStart = bindingStackPos + 1
   let tapePos = 0
   nodeStack[0] = chunk.dom
+  // Pass 1: decode path tape into (node, segment) pairs on bindingStack.
   for (let i = 0; i < totalPaths; i++) {
     const sharedDepth = pathTape[tapePos++]
     let remaining = pathTape[tapePos++]
@@ -498,6 +691,7 @@ function createBindings(
     bindingStack[++bindingStackPos] = pathTape[tapePos++]
   }
   const stackEnd = bindingStackPos
+  // Pass 2: wire each slot; expressionPool[e] holds the value for that slot.
   for (let s = stackStart, e = expressionPointer + 1; s < stackEnd; s++, e++) {
     const node = bindingStack[s] as ChildNode
     const segment = bindingStack[++s] as number
@@ -506,10 +700,17 @@ function createBindings(
   }
   bindingStack.length = stackStart
   bindingStackPos = stackStart - 1
-  chunk.b = true
+  chunk.isBound = true
   return el ? el.appendChild(chunk.dom) && el : chunk.dom
 }
 
+/**
+ * Bind a child/text slot.
+ *
+ * - Static value → Text + expression observer
+ * - Function → watch(); text or upgrade to createRenderFn for trees/lists
+ * - Template / component / array → createRenderFn immediately
+ */
 function createNodeBinding(
   node: ChildNode,
   expressionPointer: number,
@@ -520,8 +721,8 @@ function createNodeBinding(
   const capture = getHydrationCapture()
   const textNode = node.nodeType === 3 ? (node as Text) : null
 
-  if (isCmp(expression) || isTpl(expression) || Array.isArray(expression)) {
-    parentChunk.r = false
+  if (isComponentCall(expression) || isArrowTemplate(expression) || Array.isArray(expression)) {
+    parentChunk.recyclable = false // nested trees are not stale-recyclable
     const render = createRenderFn(capture)
     fragment = render(expression)!
     if (capture) {
@@ -534,8 +735,9 @@ function createNodeBinding(
     let render: RenderController | null = null
     const [frag, stop] = watch(expressionPointer, (value) => {
       if (!render) {
-        if (isCmp(value) || isTpl(value) || Array.isArray(value)) {
-          parentChunk.r = false
+        // First non-text result upgrades this slot to a full render controller.
+        if (isComponentCall(value) || isArrowTemplate(value) || Array.isArray(value)) {
+          parentChunk.recyclable = false
           render = createRenderFn(capture)
           const next = render(value)!
           if (target) {
@@ -551,7 +753,7 @@ function createNodeBinding(
       }
       return render(value)
     })
-    ;(parentChunk.u ??= []).push(stop)
+    ;(parentChunk.cleanups ??= []).push(stop)
     fragment = frag!
     if (capture) {
       registerHydrationHook(parentChunk, (map, visited) => {
@@ -580,23 +782,28 @@ function createNodeBinding(
     }
   }
 
-  if (node === parentChunk.ref.f || node === parentChunk.ref.l) {
+  // If we replaced the chunk's boundary placeholder, keep ref.first / ref.last accurate.
+  if (node === parentChunk.ref.first || node === parentChunk.ref.last) {
     const last =
       fragment.nodeType === 11
         ? (fragment.lastChild as ChildNode | null)
         : (fragment as ChildNode)
-    if (node === parentChunk.ref.f) {
-      parentChunk.ref.f =
+    if (node === parentChunk.ref.first) {
+      parentChunk.ref.first =
         fragment.nodeType === 11
           ? (fragment.firstChild as ChildNode | null)
           : (fragment as ChildNode)
     }
-    if (node === parentChunk.ref.l) parentChunk.ref.l = last
+    if (node === parentChunk.ref.last) parentChunk.ref.last = last
   }
 
   if (fragment !== node) node.parentNode?.replaceChild(fragment, node)
 }
 
+/**
+ * Bind an attribute or `@event` on an element.
+ * Events use one shared listener; the live handler is always read from the pool.
+ */
 function createAttrBinding(
   node: ChildNode,
   attrName: string,
@@ -611,12 +818,13 @@ function createAttrBinding(
   if (attrName[0] === '@') {
     const event = attrName.slice(1)
     const bindings = ((target as EventBoundElement)[eventBindingsKey] ??= {})
-    bindings[event] = { c: parentChunk, p: expressionPointer }
+    bindings[event] = { chunk: parentChunk, expressionPointer }
     const record: [Element, string] = [target, event]
     target.addEventListener(event, dispatchChunkEvent)
     target.removeAttribute(attrName)
-    ;(parentChunk.v ??= []).push(record)
+    ;(parentChunk.eventRecords ??= []).push(record)
     if (capture) {
+      // After hydrate: move listener from staged node onto the live DOM node.
       registerHydrationHook(parentChunk, (map) => {
         const adopted = map.get(target)
         if (!adopted) return
@@ -625,7 +833,7 @@ function createAttrBinding(
         if (previousBindings) {
           delete previousBindings[event]
           let hasBindings = false
-          for (const key in previousBindings) {
+          for (const _bindingName in previousBindings) {
             hasBindings = true
             break
           }
@@ -635,16 +843,16 @@ function createAttrBinding(
         target = adopted as Element
         record[0] = target
         const nextBindings = ((target as EventBoundElement)[eventBindingsKey] ??= {})
-        nextBindings[event] = { c: parentChunk, p: expressionPointer }
+        nextBindings[event] = { chunk: parentChunk, expressionPointer }
         target.addEventListener(event, dispatchChunkEvent)
         target.removeAttribute(attrName)
       })
     }
-  } else if (typeof expression === 'function' && !isTpl(expression)) {
+  } else if (typeof expression === 'function' && !isArrowTemplate(expression)) {
     const [, stop] = watch(expressionPointer, (value) =>
       setAttr(target, attrName, value as string)
     )
-    ;(parentChunk.u ??= []).push(stop)
+    ;(parentChunk.cleanups ??= []).push(stop)
     if (capture) {
       registerHydrationHook(parentChunk, (map) => {
         const adopted = map.get(target)
@@ -663,6 +871,14 @@ function createAttrBinding(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic child updates: createRenderFn (patch / keyed list / components)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stateful updater for one dynamic child expression.
+ * Keeps `previous` (Chunk | Text | Rendered[]) and a key→chunk map for reuse.
+ */
 function createRenderFn(capture: HydrationCapture | null): RenderController {
   let previous: Chunk | Text | Rendered[]
   let keyedChunks = Object.create(null) as Record<
@@ -673,15 +889,16 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
   const render = function render(
     renderable: ArrowRenderable
   ): DocumentFragment | Text | void {
+    // ---- First render ----------------------------------------------------
     if (!previous) {
-      if (isCmp(renderable)) {
+      if (isComponentCall(renderable)) {
         const [fragment, chunk] = renderComponent(renderable)
         previous = mountChunkFragment(fragment, chunk)
         return fragment
       }
-      if (isTpl(renderable)) {
+      if (isArrowTemplate(renderable)) {
         const fragment = renderable()
-        previous = mountChunkFragment(fragment, (renderable as InternalTemplate)._h!)
+        previous = mountChunkFragment(fragment, (renderable as InternalTemplate).boundChunk!)
         return fragment
       }
       if (Array.isArray(renderable)) {
@@ -692,8 +909,10 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       return (previous = document.createTextNode(renderText(renderable)))
     }
 
+    // ---- Subsequent updates ----------------------------------------------
     if (Array.isArray(renderable)) {
       if (!Array.isArray(previous)) {
+        // Scalar/tree → list: insert list after old node, then unmount old.
         const [fragment, nextList] = renderList(renderable)
         getNode(previous).after(fragment)
         forgetChunk(previous)
@@ -703,6 +922,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
         let i = 0
         const renderableLength = renderable.length
         const previousLength = previous.length
+        // Empty-list placeholder (blank text) → real list.
         if (
           renderableLength &&
           previousLength === 1 &&
@@ -714,6 +934,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
           previous = rendered
           return
         }
+        // Equal length, no keys: try index-aligned sync / patch.
         if (renderableLength === previousLength) {
           const renderedList = new Array(renderableLength) as Rendered[]
           for (; i < renderableLength; i++) {
@@ -723,25 +944,25 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
               | boolean
               | ComponentCall
               | ArrowTemplate
-            if ((isCmp(item) && item.k !== undefined) || (isTpl(item) && item._k !== undefined)) {
-              i = -1
+            if ((isComponentCall(item) && item.listKey !== undefined) || (isArrowTemplate(item) && item.listKey !== undefined)) {
+              i = -1 // bail to keyed path
               break
             }
             const prev = previous[i]
             if (
-              isTpl(item) &&
+              isArrowTemplate(item) &&
               isChunk(prev) &&
-              prev._t === item &&
-              (item as InternalTemplate)._h === prev &&
-              (item as InternalTemplate)._m
+              prev.template === item &&
+              (item as InternalTemplate).boundChunk === prev &&
+              (item as InternalTemplate).mounted
             ) {
               renderedList[i] = prev
               continue
             }
-            if (isTpl(item) && isChunk(prev)) {
+            if (isArrowTemplate(item) && isChunk(prev)) {
               const template = item as InternalTemplate
-              const proto = template._p ?? getChunkProto(template)
-              if (prev.g === proto.g) {
+              const proto = template.chunkProto ?? getChunkProto(template)
+              if (prev.signature === proto.signature) {
                 syncTemplateToChunk(template, prev, true)
                 renderedList[i] = prev
                 continue
@@ -755,21 +976,23 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
           }
           i = 0
         }
+        // Keyed reconciliation (two-ended scan + middle moves).
         const keyedList = patchKeyedList(renderable, previous)
         if (keyedList) {
           previous = keyedList
           return
         }
         if (renderableLength > previousLength && previousLength) {
+          // Fast path: prefix unchanged, only append new tail items.
           for (; i < previousLength; i++) {
             const item = renderable[i] as ArrowTemplate
             const prev = previous[i]
             if (
-              isTpl(item) &&
+              isArrowTemplate(item) &&
               isChunk(prev) &&
-              prev._t === item &&
-              (item as InternalTemplate)._h === prev &&
-              (item as InternalTemplate)._m
+              prev.template === item &&
+              (item as InternalTemplate).boundChunk === prev &&
+              (item as InternalTemplate).mounted
             ) {
               continue
             }
@@ -788,6 +1011,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
           }
           i = 0
         }
+        // Generic path: patch/mount each index, mark survivors, unmount the rest.
         let anchor: ChildNode | undefined
         const renderedList: Rendered[] = []
         const mark = ++renderedMark
@@ -805,14 +1029,14 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
           const prev = previous[i]
           let key: ArrowTemplateKey
           if (
-            isTpl(item) &&
-            (key = item._k) !== undefined &&
+            isArrowTemplate(item) &&
+            (key = item.listKey) !== undefined &&
             key in keyedChunks
           ) {
             const keyedChunk = keyedChunks[key]
             if (canSyncTemplateChunk(item as InternalTemplate, keyedChunk)) {
               syncTemplateToChunk(item as InternalTemplate, keyedChunk, true)
-              item = keyedChunk._t
+              item = keyedChunk.template
             }
           }
           if (i > previousLength - 1) {
@@ -820,23 +1044,24 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
             continue
           }
           if (
-            isTpl(item) &&
+            isArrowTemplate(item) &&
             isChunk(prev) &&
-            prev._t === item &&
-            (item as InternalTemplate)._h === prev &&
-            (item as InternalTemplate)._m
+            prev.template === item &&
+            (item as InternalTemplate).boundChunk === prev &&
+            (item as InternalTemplate).mounted
           ) {
             anchor = getNode(prev)
             renderedList[i] = prev
-            ;(prev as Rendered & { mk?: number }).mk = mark
+            ;(prev as Rendered & { renderMark?: number }).renderMark = mark
             continue
           }
           const used = patch(item, prev, anchor) as Rendered
           anchor = getNode(used)
           renderedList[i] = used
-          ;(used as Rendered & { mk?: number }).mk = mark
+          ;(used as Rendered & { renderMark?: number }).renderMark = mark
         }
         if (!renderableLength) {
+          // List cleared → leave a blank text placeholder so the slot stays addressable.
           const placeholder = (renderedList[0] = document.createTextNode(''))
           const sync = canSyncUnmount(previous)
           const detached = sync && replaceListWithPlaceholder(previous, placeholder)
@@ -851,13 +1076,14 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
         }
         for (i = 0; i < previousLength; i++) {
           const stale = previous[i]
-          if ((stale as Rendered & { mk?: number }).mk === mark) continue
+          if ((stale as Rendered & { renderMark?: number }).renderMark === mark) continue
           forgetChunk(stale)
           unmount(stale)
         }
         previous = renderedList
       }
     } else {
+      // Non-array update: patch single previous value.
       if (Array.isArray(previous)) keyedChunks = Object.create(null)
       previous = patch(renderable, previous)
     }
@@ -888,10 +1114,11 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     return [fragment, renderedItems]
   }
 
+  /** Reuse a component chunk if the factory matches; refresh props/events. */
   function syncComponentChunk(renderable: ComponentCall, chunk: Chunk) {
-    if (chunk.s?.[1] !== renderable.h) return false
-    if (chunk.s[0] !== renderable.p) chunk.s[0] = renderable.p
-    if (chunk.s[2] !== renderable.e) chunk.s[2] = renderable.e
+    if (chunk.propsBox?.factory !== renderable.factory) return false
+    if (chunk.propsBox.props !== renderable.props) chunk.propsBox.props = renderable.props
+    if (chunk.propsBox.events !== renderable.events) chunk.propsBox.events = renderable.events
     return true
   }
 
@@ -899,7 +1126,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     renderable: ComponentCall | ArrowTemplate,
     chunk: Chunk
   ) {
-    if (isCmp(renderable)) return syncComponentChunk(renderable, chunk)
+    if (isComponentCall(renderable)) return syncComponentChunk(renderable, chunk)
     if (!canSyncTemplateChunk(renderable as InternalTemplate, chunk)) return false
     syncTemplateToChunk(renderable as InternalTemplate, chunk, true)
     return true
@@ -918,6 +1145,15 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     moveDOMRef(chunk.ref, target.parentNode, target)
   }
 
+  /**
+   * Keyed list diff. Returns null when the list is not fully keyed / syncable,
+   * so the caller falls back to the generic path.
+   *
+   * Algorithm sketch (similar to Vue keyed):
+   * 1) shared prefix (same keys in order)
+   * 2) two-pointer ends (head/head, tail/tail, cross swaps)
+   * 3) middle: map by key, move / mount / unmount
+   */
   function patchKeyedList(
     renderable: Array<string | number | boolean | ComponentCall | ArrowTemplate>,
     previousList: Rendered[]
@@ -945,20 +1181,21 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       Exclude<ArrowTemplateKey, undefined>,
       1
     >
+    // Walk common head while keys match and chunks can sync.
     for (; sharedPrefix < previousLength && sharedPrefix < renderableLength; sharedPrefix++) {
       const rendered = previousList[sharedPrefix]
-      if (!isChunk(rendered) || rendered.k === undefined) return null
+      if (!isChunk(rendered) || rendered.key === undefined) return null
       const item = renderable[sharedPrefix]
-      if (!isCmp(item) && !isTpl(item)) return null
+      if (!isComponentCall(item) && !isArrowTemplate(item)) return null
       const key = getRenderableKey(item)
-      if (key === undefined || key !== rendered.k) break
+      if (key === undefined || key !== rendered.key) break
       sharedPrefixKeys[key] = 1
       if (
         !(
-          isTpl(item) &&
-          rendered._t === item &&
-          (item as InternalTemplate)._h === rendered &&
-          (item as InternalTemplate)._m
+          isArrowTemplate(item) &&
+          rendered.template === item &&
+          (item as InternalTemplate).boundChunk === rendered &&
+          (item as InternalTemplate).mounted
         ) &&
         !syncKeyedRenderable(item, rendered)
       ) {
@@ -971,7 +1208,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       const fragment = document.createDocumentFragment()
       for (let i = sharedPrefix; i < renderableLength; i++) {
         const item = renderable[i]
-        if (!isCmp(item) && !isTpl(item)) return null
+        if (!isComponentCall(item) && !isArrowTemplate(item)) return null
         const key = getRenderableKey(item)
         if (key === undefined || key in sharedPrefixKeys) return null
         sharedPrefixKeys[key] = 1
@@ -999,28 +1236,29 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     let oldEnd = previousLength - 1
     let newEnd = renderableLength - 1
 
+    // Two-ended scan: match heads, tails, or rotate ends into place.
     while (oldStart <= oldEnd && newStart <= newEnd) {
       const startChunk = previousList[oldStart] as Chunk
       const endChunk = previousList[oldEnd] as Chunk
-      const startKey = startChunk.k as Exclude<ArrowTemplateKey, undefined>
-      const endKey = endChunk.k as Exclude<ArrowTemplateKey, undefined>
+      const startKey = startChunk.key as Exclude<ArrowTemplateKey, undefined>
+      const endKey = endChunk.key as Exclude<ArrowTemplateKey, undefined>
       const nextStart = renderable[newStart]
       const nextEnd = renderable[newEnd]
       const nextStartKey =
-        isCmp(nextStart) || isTpl(nextStart)
+        isComponentCall(nextStart) || isArrowTemplate(nextStart)
           ? getRenderableKey(nextStart)
           : undefined
       const nextEndKey =
-        isCmp(nextEnd) || isTpl(nextEnd) ? getRenderableKey(nextEnd) : undefined
+        isComponentCall(nextEnd) || isArrowTemplate(nextEnd) ? getRenderableKey(nextEnd) : undefined
       if (nextStartKey === undefined || nextEndKey === undefined) return null
 
       if (startKey === nextStartKey) {
         if (
           !(
-            isTpl(nextStart) &&
-            startChunk._t === nextStart &&
-            (nextStart as InternalTemplate)._h === startChunk &&
-            (nextStart as InternalTemplate)._m
+            isArrowTemplate(nextStart) &&
+            startChunk.template === nextStart &&
+            (nextStart as InternalTemplate).boundChunk === startChunk &&
+            (nextStart as InternalTemplate).mounted
           ) &&
           !syncKeyedRenderable(nextStart as ComponentCall | ArrowTemplate, startChunk)
         ) {
@@ -1033,10 +1271,10 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       if (endKey === nextEndKey) {
         if (
           !(
-            isTpl(nextEnd) &&
-            endChunk._t === nextEnd &&
-            (nextEnd as InternalTemplate)._h === endChunk &&
-            (nextEnd as InternalTemplate)._m
+            isArrowTemplate(nextEnd) &&
+            endChunk.template === nextEnd &&
+            (nextEnd as InternalTemplate).boundChunk === endChunk &&
+            (nextEnd as InternalTemplate).mounted
           ) &&
           !syncKeyedRenderable(nextEnd as ComponentCall | ArrowTemplate, endChunk)
         ) {
@@ -1049,10 +1287,10 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       if (startKey === nextEndKey) {
         if (
           !(
-            isTpl(nextEnd) &&
-            startChunk._t === nextEnd &&
-            (nextEnd as InternalTemplate)._h === startChunk &&
-            (nextEnd as InternalTemplate)._m
+            isArrowTemplate(nextEnd) &&
+            startChunk.template === nextEnd &&
+            (nextEnd as InternalTemplate).boundChunk === startChunk &&
+            (nextEnd as InternalTemplate).mounted
           ) &&
           !syncKeyedRenderable(nextEnd as ComponentCall | ArrowTemplate, startChunk)
         ) {
@@ -1070,10 +1308,10 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       if (endKey === nextStartKey) {
         if (
           !(
-            isTpl(nextStart) &&
-            endChunk._t === nextStart &&
-            (nextStart as InternalTemplate)._h === endChunk &&
-            (nextStart as InternalTemplate)._m
+            isArrowTemplate(nextStart) &&
+            endChunk.template === nextStart &&
+            (nextStart as InternalTemplate).boundChunk === endChunk &&
+            (nextStart as InternalTemplate).mounted
           ) &&
           !syncKeyedRenderable(nextStart as ComponentCall | ArrowTemplate, endChunk)
         ) {
@@ -1088,6 +1326,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     }
 
     if (newStart > newEnd) {
+      // New list exhausted → remaining old items are stale.
       for (let i = oldStart; i <= oldEnd; i++) {
         const stale = previousList[i]
         forgetChunk(stale)
@@ -1097,10 +1336,11 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     }
 
     if (oldStart > oldEnd) {
+      // Old list exhausted → mount remaining new items before the next sibling.
       const fragment = document.createDocumentFragment()
       for (let i = newStart; i <= newEnd; i++) {
         const item = renderable[i]
-        if (!isCmp(item) && !isTpl(item)) return null
+        if (!isComponentCall(item) && !isArrowTemplate(item)) return null
         renderedList[i] = mountItem(item, fragment)
       }
       parent.insertBefore(
@@ -1112,14 +1352,15 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       return renderedList
     }
 
+    // Middle segment: index old/new by key (store i+1 so 0 stays "missing").
     const previousIndexByKey = Object.create(null) as Record<
       Exclude<ArrowTemplateKey, undefined>,
       number
     >
     for (let i = oldStart; i <= oldEnd; i++) {
       const rendered = previousList[i]
-      if (!isChunk(rendered) || rendered.k === undefined) return null
-      const key = rendered.k as Exclude<ArrowTemplateKey, undefined>
+      if (!isChunk(rendered) || rendered.key === undefined) return null
+      const key = rendered.key as Exclude<ArrowTemplateKey, undefined>
       if (key in previousIndexByKey) return null
       previousIndexByKey[key] = i + 1
     }
@@ -1132,18 +1373,19 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     for (let i = newStart; i <= newEnd; i++) {
       const item = renderable[i]
       const key =
-        isCmp(item) || isTpl(item) ? getRenderableKey(item) : undefined
+        isComponentCall(item) || isArrowTemplate(item) ? getRenderableKey(item) : undefined
       if (key === undefined || key in middleIndexByKey) return null
       middleIndexByKey[key] = i + 1
       if (key in previousIndexByKey) overlaps++
     }
     if (!overlaps) {
+      // No key overlap in the middle → wipe the old range and mount fresh.
       const first = getNode(previousList[oldStart], undefined, true)
       const last = getNode(previousList[oldEnd])
       const fragment = document.createDocumentFragment()
       for (let i = newStart; i <= newEnd; i++) {
         const item = renderable[i]
-        if (!isCmp(item) && !isTpl(item)) return null
+        if (!isComponentCall(item) && !isArrowTemplate(item)) return null
         renderedList[i] = mountItem(item, fragment)
       }
       const parent = first.parentNode
@@ -1164,9 +1406,10 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       return renderedList
     }
 
+    // Sync surviving keys into renderedList; unmount keys that disappeared.
     for (let i = oldStart; i <= oldEnd; i++) {
       const stale = previousList[i] as Chunk
-      const nextIndex = middleIndexByKey[stale.k as Exclude<ArrowTemplateKey, undefined>]
+      const nextIndex = middleIndexByKey[stale.key as Exclude<ArrowTemplateKey, undefined>]
       if (nextIndex === undefined) {
         forgetChunk(stale)
         unmount(stale)
@@ -1177,6 +1420,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       renderedList[nextIndex - 1] = stale
     }
 
+    // Walk new middle right→left and insert/move nodes so order matches.
     let before =
       newEnd + 1 < renderableLength
         ? getNode(renderedList[newEnd + 1], undefined, true)
@@ -1187,7 +1431,7 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       const existing = renderedList[i]
       if (!existing) {
         const item = renderable[i]
-        if (!isCmp(item) && !isTpl(item)) return null
+        if (!isComponentCall(item) && !isArrowTemplate(item)) return null
         const fragment = document.createDocumentFragment()
         const mounted = mountItem(item, fragment)
         renderedList[i] = mounted
@@ -1205,6 +1449,10 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     return renderedList
   }
 
+  /**
+   * Patch a single previous value to match `renderable`.
+   * Prefers keyed reuse / same-shape sync before mount+unmount.
+   */
   function patch(
     renderable: Exclude<
       ArrowRenderable,
@@ -1214,8 +1462,8 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     anchor?: ChildNode
   ): Chunk | Text | Rendered[] {
     const nodeType = (prev as Node).nodeType ?? 0
-    if (isCmp(renderable)) {
-      const key = renderable.k
+    if (isComponentCall(renderable)) {
+      const key = renderable.listKey
       if (key !== undefined && key in keyedChunks) {
         const keyedChunk = keyedChunks[key]
         if (syncComponentChunk(renderable, keyedChunk)) {
@@ -1224,9 +1472,9 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
           return keyedChunk
         }
       } else if (isChunk(prev) && syncComponentChunk(renderable, prev)) {
-        if (prev.k !== renderable.k) {
+        if (prev.key !== renderable.listKey) {
           forgetChunk(prev)
-          prev.k = renderable.k
+          prev.key = renderable.listKey
           rememberKeyedChunk(prev)
         }
         return prev
@@ -1239,14 +1487,14 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
       rememberKeyedChunk(chunk)
       return mounted
     }
-    if (!isTpl(renderable) && nodeType === 3) {
+    if (!isArrowTemplate(renderable) && nodeType === 3) {
       const value = renderText(renderable)
       if ((prev as Text).data !== value) (prev as Text).data = value
       return prev
     }
-    if (isTpl(renderable)) {
+    if (isArrowTemplate(renderable)) {
       const template = renderable as InternalTemplate
-      const key = template._k
+      const key = template.listKey
       if (key !== undefined && key in keyedChunks) {
         const keyedChunk = keyedChunks[key]
         if (canSyncTemplateChunk(template, keyedChunk)) {
@@ -1257,12 +1505,12 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
         }
       }
       const proto = getChunkProto(template)
-      if (isChunk(prev) && prev.g === proto.g) {
+      if (isChunk(prev) && prev.signature === proto.signature) {
         syncTemplateToChunk(template, prev, true)
         return prev
       }
       const fragment = renderable()
-      const chunk = template._h!
+      const chunk = template.boundChunk!
       const mounted = mountChunkFragment(fragment, chunk)
       getNode(prev, anchor).after(fragment)
       forgetChunk(prev)
@@ -1281,15 +1529,15 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     item: string | number | boolean | ComponentCall | ArrowTemplate,
     fragment: DocumentFragment
   ): Rendered {
-    if (isCmp(item)) {
+    if (isComponentCall(item)) {
       const [inner, chunk] = renderComponent(item)
       fragment.appendChild(inner)
       rememberKeyedChunk(chunk)
       return mountChunkFragment(fragment, chunk)
     }
-    if (isTpl(item)) {
+    if (isArrowTemplate(item)) {
       item(fragment)
-      const chunk = (item as InternalTemplate)._h!
+      const chunk = (item as InternalTemplate).boundChunk!
       rememberKeyedChunk(chunk)
       return mountChunkFragment(fragment, chunk)
     }
@@ -1298,28 +1546,33 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     return node
   }
 
+  /** Prefer returning the chunk; if it has no DOM span yet, keep a text placeholder. */
   function mountChunkFragment(fragment: DocumentFragment, chunk: Chunk): Rendered {
-    if (chunk.ref.f) return chunk
+    if (chunk.ref.first) return chunk
     const placeholder = document.createTextNode('')
     fragment.appendChild(placeholder)
     return placeholder
   }
 
   function rememberKeyedChunk(chunk: Chunk) {
-    if (chunk.k !== undefined) keyedChunks[chunk.k] = chunk
+    if (chunk.key !== undefined) keyedChunks[chunk.key] = chunk
   }
 
   function forgetChunk(item: Chunk | Text | Rendered[] | undefined) {
-    if (isChunk(item) && item.k !== undefined && keyedChunks[item.k] === item) {
-      delete keyedChunks[item.k]
+    if (isChunk(item) && item.key !== undefined && keyedChunks[item.key] === item) {
+      delete keyedChunks[item.key]
     }
   }
 
+  /**
+   * Run a component factory once: props proxy + cleanup collector → template().
+   * Factory identity is stored on `chunk.propsBox` so later calls can sync without remount.
+   */
   function renderComponent(renderable: ComponentCall): [DocumentFragment, Chunk] {
     const [props, emit, box] = createPropsProxy(
-      renderable.p,
-      renderable.h,
-      renderable.e
+      renderable.props,
+      renderable.factory,
+      renderable.events
     )
     const cleanups: Array<() => void> = []
     const previousCollector = swapCleanupCollector(cleanups)
@@ -1327,24 +1580,28 @@ function createRenderFn(capture: HydrationCapture | null): RenderController {
     let fragment: DocumentFragment
 
     try {
-      template = renderable.h(props, emit) as InternalTemplate
+      template = renderable.factory(props, emit) as InternalTemplate
       fragment = template() as DocumentFragment
     } finally {
       swapCleanupCollector(previousCollector)
     }
 
-    const chunk = template._c()
+    const chunk = template.getChunk()
     if (cleanups.length) {
-      ;(chunk.u ??= []).push(...cleanups)
+      ;(chunk.cleanups ??= []).push(...cleanups)
     }
-    chunk.r = false
-    chunk.s = box
-    chunk.k = renderable.k
+    chunk.recyclable = false
+    chunk.propsBox = box
+    chunk.key = renderable.listKey
     return [fragment, chunk]
   }
 
   return render
 }
+
+// ---------------------------------------------------------------------------
+// Unmount: microtask batch → recycle (stale) or destroy (pool)
+// ---------------------------------------------------------------------------
 
 let unmountStack: Array<
   | Chunk
@@ -1353,17 +1610,21 @@ let unmountStack: Array<
   | Array<Chunk | Text>
 > = []
 
+/**
+ * Tear down a chunk completely: events, cleanups, expressions, DOM, free shell.
+ * `detached` skips removing nodes that were already taken out of the document.
+ */
 function destroyChunk(chunk: Chunk, detached = false) {
-  if (chunk.st) removeStaleChunk(chunk)
+  if (chunk.isStale) removeStaleChunk(chunk)
   releaseTemplate(chunk)
-  if (chunk.v) {
-    for (let i = 0; i < chunk.v.length; i++) {
-      const [target, event] = chunk.v[i]
+  if (chunk.eventRecords) {
+    for (let i = 0; i < chunk.eventRecords.length; i++) {
+      const [target, event] = chunk.eventRecords[i]
       const bindings = (target as EventBoundElement)[eventBindingsKey]
       if (bindings) {
         delete bindings[event]
         let hasBindings = false
-        for (const key in bindings) {
+        for (const _bindingName in bindings) {
           hasBindings = true
           break
         }
@@ -1372,17 +1633,17 @@ function destroyChunk(chunk: Chunk, detached = false) {
       target.removeEventListener(event, dispatchChunkEvent)
     }
   }
-  if (chunk.u) {
-    for (let i = 0; i < chunk.u.length; i++) chunk.u[i]()
-    chunk.u = null
+  if (chunk.cleanups) {
+    for (let i = 0; i < chunk.cleanups.length; i++) chunk.cleanups[i]()
+    chunk.cleanups = null
   }
-  if (chunk.e + 1) {
-    releaseExpressions(chunk.e)
-    chunk.e = -1
+  if (chunk.expressionPointer + 1) {
+    releaseExpressions(chunk.expressionPointer)
+    chunk.expressionPointer = -1
   }
-  let node = chunk.ref.f
+  let node = chunk.ref.first
   if (!detached && node) {
-    const last = chunk.ref.l
+    const last = chunk.ref.last
     if (node === last) node.remove()
     else {
       while (node) {
@@ -1395,40 +1656,49 @@ function destroyChunk(chunk: Chunk, detached = false) {
     }
   }
   chunk.dom.textContent = ''
-  chunk.ref.f = chunk.ref.l = null
-  chunk.k = chunk.i = chunk.s = undefined
-  chunk.u = chunk.v = null
-  chunk.b = chunk.st = false
-  chunk.r = true
-  chunk.g = ''
+  chunk.ref.first = chunk.ref.last = null
+  chunk.key = chunk.stableId = chunk.propsBox = undefined
+  chunk.cleanups = chunk.eventRecords = null
+  chunk.isBound = chunk.isStale = false
+  chunk.recyclable = true
+  chunk.signature = ''
   freeChunk(chunk)
 }
 
+/**
+ * Park a recyclable chunk for later reuse: move DOM back into `chunk.dom`,
+ * register in staleBySignature (and staleById if `.id()` was set).
+ */
 function recycleChunk(chunk: Chunk, detached = false) {
   if (!detached) moveDOMRef(chunk.ref, chunk.dom)
   releaseTemplate(chunk)
-  if (chunk.st || !chunk.r) return
-  chunk.st = true
-  let bucket = staleBySignature.get(chunk.g)
+  if (chunk.isStale || !chunk.recyclable) return
+  chunk.isStale = true
+  let bucket = staleBySignature.get(chunk.signature)
   if (!bucket) {
     bucket = {}
-    staleBySignature.set(chunk.g, bucket)
+    staleBySignature.set(chunk.signature, bucket)
   }
-  chunk.bkn = bucket.h
-  bucket.h = chunk
-  if (chunk.i !== undefined) staleById.set(chunk.i, chunk)
+  chunk.staleNext = bucket.head
+  bucket.head = chunk
+  if (chunk.stableId !== undefined) staleById.set(chunk.stableId, chunk)
 }
 
 let unmountQueued = false
 
+/** True when every list item is a recyclable chunk (or text) — safe for sync remove. */
 function canSyncUnmount(chunk: Array<Chunk | Text>) {
   for (let i = 0; i < chunk.length; i++) {
     const item = chunk[i]
-    if (isChunk(item) && !item.r) return false
+    if (isChunk(item) && !item.recyclable) return false
   }
   return true
 }
 
+/**
+ * If the list owns the parent's entire child list, swap it for `placeholder`
+ * in one `replaceChildren` (nodes stay detached for recycle).
+ */
 function replaceListWithPlaceholder(
   chunk: Array<Chunk | Text>,
   placeholder: Text
@@ -1444,6 +1714,7 @@ function replaceListWithPlaceholder(
   return true
 }
 
+/** Recycle or destroy one rendered value (or a list of them). */
 function removeUnmounted(
   chunk:
     | Chunk
@@ -1453,7 +1724,7 @@ function removeUnmounted(
   detached = false
 ) {
   if (isChunk(chunk)) {
-    if (chunk.r) recycleChunk(chunk, detached)
+    if (chunk.recyclable) recycleChunk(chunk, detached)
     else destroyChunk(chunk, detached)
     return
   }
@@ -1479,25 +1750,25 @@ function removeUnmounted(
     for (let i = 0; i < chunk.length; i++) {
       const item = chunk[i]
       if (isChunk(item)) {
-        if (!item.r) {
+        if (!item.recyclable) {
           destroyChunk(item, detached)
           continue
         }
         if (!detached) moveDOMRef(item.ref, item.dom)
         releaseTemplate(item)
-        if (item.st) continue
-        item.st = true
-        if (signature !== item.g) {
-          signature = item.g
+        if (item.isStale) continue
+        item.isStale = true
+        if (signature !== item.signature) {
+          signature = item.signature
           bucket = staleBySignature.get(signature)
           if (!bucket) {
             bucket = {}
             staleBySignature.set(signature, bucket)
           }
         }
-        item.bkn = bucket!.h
-        bucket!.h = item
-        if (item.i !== undefined) staleById.set(item.i, item)
+        item.staleNext = bucket!.head
+        bucket!.head = item
+        if (item.stableId !== undefined) staleById.set(item.stableId, item)
       } else if (!detached) {
         item.remove()
       }
@@ -1521,6 +1792,7 @@ function scheduleUnmountDrain() {
   queueMicrotask(drainUnmountStack)
 }
 
+/** Queue a value for teardown on the next microtask (batches nested unmounts). */
 function unmount(
   chunk:
     | Chunk
@@ -1534,17 +1806,19 @@ function unmount(
   scheduleUnmountDrain()
 }
 
+/** Coerce nullish / falsey values to empty string; keep `0`. */
 function renderText(value: unknown) {
   return value || value === 0 ? (value as string) : ''
 }
 
+/** Boundary ChildNode for a rendered value (`first` picks ref.firstirst / list head). */
 function getNode(
   chunk: Chunk | Text | Array<Chunk | Text>,
   anchor?: ChildNode,
   first?: boolean
 ): ChildNode {
   if (isChunk(chunk)) {
-    return first ? chunk.ref.f! : chunk.ref.l!
+    return first ? chunk.ref.first! : chunk.ref.last!
   }
   if (Array.isArray(chunk)) {
     return getNode(chunk[first ? 0 : chunk.length - 1], anchor, first)
@@ -1552,6 +1826,7 @@ function getNode(
   return chunk!
 }
 
+/** Remap staged render state onto live SSR DOM via the hydrate NodeMap. */
 function adoptRenderedValue(
   value: Chunk | Text | Rendered[] | undefined,
   capture: HydrationCapture,
@@ -1573,6 +1848,18 @@ function adoptRenderedValue(
   return (map.get(value) as Text | undefined) ?? value
 }
 
+// ---------------------------------------------------------------------------
+// Path tape construction (used by resolveChunkProto)
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk parsed template DOM and encode every `¤` placeholder location.
+ *
+ * Each record on pathTape:
+ *   [sharedDepth, remainingDepth, childIndex..., segment]
+ * where segment is 0 (node) or 1-based index into attrNames.
+ * sharedDepth compresses paths that share a prefix with the previous record.
+ */
 function createPaths(dom: DocumentFragment): Chunk['paths'] {
   const pathTape: number[] = []
   const attrNames: string[] = []
@@ -1597,11 +1884,14 @@ function createPaths(dom: DocumentFragment): Chunk['paths'] {
       const attrs = (node as Element).attributes
       for (let i = 0; i < attrs.length; i++) {
         const attr = attrs[i]
+        // Attribute slot: value was the delimiter comment string.
         if (attr.value === delimiterComment) pushPath(attr.name)
       }
     } else if (node.nodeType === 8) {
+      // Comment placeholder from `<!--¤-->` between tags.
       pushPath()
     } else if (node.nodeType === 3 && node.nodeValue === delimiterComment) {
+      // Text node that absorbed the delimiter (e.g. mid-text expression).
       pushPath()
     }
     const children = node.childNodes
@@ -1620,6 +1910,10 @@ function createPaths(dom: DocumentFragment): Chunk['paths'] {
   return [pathTape, attrNames]
 }
 
+/**
+ * After paths are recorded, turn delimiter comments/text into empty Text nodes
+ * so createNodeBinding can replaceChild them at bind time.
+ */
 function normalizeNodePlaceholders(dom: DocumentFragment) {
   const walk = (node: Node) => {
     const children = node.childNodes

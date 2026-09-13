@@ -25,8 +25,8 @@ describe('hydration capture', () => {
 
       activeTemplate(activeRoot)
 
-      expect(capture.hooks.get(template._c())).toBeUndefined()
-      expect(capture.hooks.get(activeTemplate._c())?.length).toBeGreaterThan(0)
+      expect(capture.hooks.get(template.getChunk())).toBeUndefined()
+      expect(capture.hooks.get(activeTemplate.getChunk())?.length).toBeGreaterThan(0)
     } finally {
       installHydrationCaptureProvider(null)
     }

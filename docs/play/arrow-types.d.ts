@@ -21,9 +21,9 @@ declare module '@arrow-js/core' {
   export interface ArrowTemplate {
     (parent: ParentNode): ParentNode
     (): DocumentFragment
-    isT: boolean
+    isTemplate: boolean
     key: (key: string | number | undefined) => ArrowTemplate
-    _c: () => Chunk
+    getChunk: () => Chunk
   }
 
   export interface Chunk {}
